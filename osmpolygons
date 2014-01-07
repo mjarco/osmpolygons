@@ -1,0 +1,311 @@
+#!/usr/bin/env python
+#coding=utf8
+from xml import sax
+import argparse
+import sys
+from collections import namedtuple
+from pickle import dumps, loads
+from gis import save_polygons, distance_km, longest_cycle, line_up, pointify
+
+Member = namedtuple("Member", "type,ref,role")
+Point = namedtuple("Point", "lat, lon")
+
+class NodesHandler(sax.handler.ContentHandler):
+    """NodesHandler collects points in dict mapping ref=>Point
+
+    Will gather only points with refs as requested in constructor parameter"""
+    def __init__(self, nodes_refs):
+        sax.handler.ContentHandler.__init__(self)
+        self.watched = set(nodes_refs)
+        self.points = {}
+
+    def startElement(self, name, attrs):
+        if name == 'node' and attrs.get('id') in self.watched:
+            attrs_dict = dict(attrs.items())
+            self.points[attrs_dict['id']]=Point(attrs_dict['lat'],attrs_dict['lon'])
+
+
+class Way(object):
+    """Abstraction for OSM way entities
+        Keeps all tags and node references
+    """
+    def __init__(self, attrs):
+        self.nodes_refs = []
+        self.tags = []
+        self.tags_dict = {}
+        self.line = []
+        self.id = attrs['id']
+        self.role = attrs.get('role', None)
+        if not self.role:
+            self.role = 'outer'
+
+    def points(self):
+        return [x.ref for x in self.nodes if x.type=='nd']
+
+
+class WaysHandler(sax.handler.ContentHandler):
+    """Collects way entities as ref=>Way dictionary
+
+    Will gather only ways with refs as requested in constructor parameter
+    """
+    def __init__(self, ids):
+        sax.handler.ContentHandler.__init__(self)
+        self.watched = set(ids)
+        self.ways = {}
+        self.record = False
+
+    def startElement(self, name, attrs):
+        # process all filtered way entities and it's descendant
+        if name == 'way' and attrs.get('id') in self.watched:
+            self.record = True
+            self.current = Way(attrs)
+        elif self.record:  # we're still inside way entity
+            if name == 'nd':
+                attrs_dict = dict(attrs.items())
+                self.current.nodes_refs.append(attrs_dict['ref'])
+            elif name == 'tag':
+                self.current.tags.append(attrs.items())
+
+    def endElement(self, name):
+        if not self.record:  # we're not processing way node
+            return
+        if name != 'way':  # some inner entities are emitting 'end' event
+            return
+        # let's clean current way element, and store way in mapping
+        self.record = False
+        self.current.tags_dict = dict(self.current.tags)
+        self.ways[self.current.id] = self.current
+        self.current = None
+
+
+class Relation(object):
+    """Abstraction for relations, will hold way refs and metadata of relation
+    """
+    def __init__(self, attrs):
+        self.members = []
+        self.tags = []
+        self.tags_dict = {}
+        self.polylines = []
+
+    def ways_refs(self):
+        return [x.ref for x in self.members if x.type=='way']
+
+
+class RelationsHandler(sax.handler.ContentHandler):
+    """
+    Gathers relations which are tagged as requested in filter argument
+    Goal is to store relation meta data and way references
+    """
+    def __init__(self, filter_):
+        sax.handler.ContentHandler.__init__(self)
+        self.relations = []
+        self.record = False
+        self.filter = filter_
+
+    def startElement(self, name, attrs):
+
+        if name == 'relation':
+            # print 'been here'
+            self.record = True
+            self.current = Relation(attrs)
+        elif self.record:
+            if name == 'member':
+                self.current.members.append(Member(**dict(attrs.items())))
+            elif name == 'tag':
+                self.current.tags.append(attrs.items())
+
+
+    def endElement(self, name):
+
+        if not self.record: # we're not in relation element
+            return
+
+        if name != 'relation': # we're processing some nested element
+            return
+        # ok, it's end of relation entity
+        # stop recording, check if tags contains admin_level=6
+        self.record = False
+        # trasfer tags into dict
+        self.current.tags_dict = {x[0][1]:x[1][1] for x in self.current.tags}
+
+        # check for filters
+        include = True
+        for k,v in self.filter.items():
+            if k not in self.current.tags_dict or self.current.tags_dict[k] != v:
+                include = False
+        if include:
+            self.relations.append(self.current)
+
+        self.current = None
+
+
+def solve_relations(relations, ways, points):
+    data = []
+    # print 'relations', repr([x.tags_dict for x in relations])
+    for relation in relations:
+        # print 'solvent relation', repr(relation.tags_dict)
+        lines_refs = relation.ways_refs()
+        for line_ref in lines_refs:
+            #solve points for way based on nodes_refs
+            try:
+                way = ways[line_ref]
+                if way.role != 'outer':
+                    continue
+                points_refs = way.nodes_refs
+
+                # print 'polyline exist'
+                line = []
+                for pref in points_refs:
+                    if pref in points:
+                        # print 'point exist'
+                        line.append(points[pref])
+                #append line to relation polyline
+                relation.polylines.append(line)
+            except KeyError:
+                pass
+        data.append((relation.tags_dict, relation.polylines))
+
+    return data
+
+def discover_relations(filters, f_osm_data):
+    rhandler = RelationsHandler(filters)
+    f_osm_data.seek(0)
+    sax.parse(f_osm_data, rhandler)
+    relations = rhandler.relations
+    open('raw_relations.data', 'w').write(dumps(relations))
+    return relations
+
+
+def discover_ways(relations, f_osm_data):
+    ways_refs = []
+    for relation in relations:
+        ways_refs.extend([member.ref for member in relation.members])
+    whandler = WaysHandler(ways_refs)
+    f_osm_data.seek(0)
+    sax.parse(f_osm_data, whandler)
+    ways = whandler.ways
+    open('raw_ways.data', 'w').write(dumps(ways))
+    return ways
+
+
+def discover_nodes(ways, f_osm_data):
+    nodes_refs = []
+    for way in ways.values():
+        nodes_refs.extend(way.nodes_refs)
+    nhandler = NodesHandler(nodes_refs)
+    f_osm_data.seek(0)
+    sax.parse(f_osm_data, nhandler)
+    points = nhandler.points
+    open('raw_points.data', 'w').write(dumps(points))
+
+    return points
+
+def extract_meta(tags, meta_keys):
+    meta = {}
+    for key in meta_keys:
+        if key in tags:
+            meta[key] = tags[key].encode('utf8')
+        else:
+            meta[key]=''
+    return meta
+
+def prepare_area(area, meta_keys):
+    tags, ways = area
+    name = tags['name'].encode('utf8')
+
+    meta = extract_meta(tags, meta_keys)
+    paths = [map(lambda y: pointify(y), x) for x in ways]
+
+    boundaries = line_up(paths, lambda x,y:distance_km(x,y)==0, try_head=True)
+
+    #trim excessive polygonpoints
+    return ([meta] * len(boundaries), [longest_cycle(outer) for outer in boundaries])
+
+
+def load_cached(filters, f_osm_data):
+    try:
+        merged = loads(open('merged.data', 'r').read())
+        return merged
+    except:
+        pass
+
+    try:
+        relations = loads(open('raw_relations.data', 'r').read())
+    except IOError:
+        relations = discover_relations(filters, f_osm_data)
+
+    try:
+        ways = loads(open('raw_ways.data', 'r').read())
+    except IOError:
+        ways = discover_ways(relations, f_osm_data)
+
+    try:
+        points = loads(open('raw_points.data', 'r').read())
+    except IOError:
+        points = discover_nodes(ways, f_osm_data)
+
+    merged = solve_relations(relations, ways, points)
+    open('merged.data', 'w').write(dumps(merged))
+    return merged
+
+def process(filters, f_osm_data):
+    relations = discover_relations(filters, f_osm_data)
+    ways = discover_ways(relations, f_osm_data)
+    points = discover_nodes(ways, f_osm_data)
+    merged = solve_relations(relations, ways, points)
+    return merged
+
+def main(args):
+    """
+    extracts powiats data from osm files as follows:
+    1) Gather relations from osm file which are tagged as admin_level=6
+    2) Gather way from osm file which are referenced in relations
+    3) Collect nodes referenced in ways
+    4) Simplyfy above sets by dereferencing ways and nodes into list of series of latlong points
+    5) Join ways into polygon ring(s)
+    6) Fix rings (joined ways will contain redundant points)
+    6) Save polygon layer
+    """
+    merged = None
+    if args.use_cache:
+        merged = load_cached(args.filter, args.input)
+    else:
+        merged = process(args.filter, args.input)
+
+    polys = []
+    metas = []
+    for area in merged:
+        meta, poly = prepare_area(area, args.meta_keys)
+        polys.extend(poly)
+        metas.extend(meta)
+
+    save_polygons(args.out, polys, metas)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input', nargs='?', default=sys.stdin,
+                       type=argparse.FileType('r'))
+
+    parser.add_argument("--filter", '-f', dest='filter',
+        help="comma separated k=v pairs of relation tag filters",
+        type=lambda x: dict(tuple(map(lambda z: z.strip(), y.split("=")) for y in x.split(','))),
+        default={'admin_level':6})
+
+    parser.add_argument("--include-tags", '-i', dest='meta_keys',
+        help="comma separated list of tag names to be extracted as meta data",
+        type=lambda x: map(lambda y: y.strip(), x.split(',')),
+        default=['name'])
+
+    parser.add_argument('--no-cache',
+        dest='use_cache',
+        help='disable partial results caches',
+        default=True,
+        action='store_false')
+
+    parser.add_argument('--out', '-o',
+        dest='out',
+        help='output file name (without extension)',
+        default='out')
+
+    main(parser.parse_args())
